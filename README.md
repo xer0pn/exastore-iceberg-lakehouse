@@ -1,55 +1,49 @@
-# README Template
+# Apache Iceberg Lakehouse on AWS
 
-Below is a template provided for use when building your README file for students.
+Build a medallion-architecture data lakehouse using Apache Iceberg, AWS Glue, S3 Tables, and Athena. Ingest CDC and clickstream data through Bronze → Silver → Gold layers, then explore Iceberg features like snapshots and time-travel.
 
-# Project Title
+```
+CDC JSON (S3)    ──→  Glue: CDC Bronze    ──→  S3 Iceberg (orders, users, products)
+Events JSON (S3) ──→  Glue: Events Bronze ──→  S3 Iceberg (events)
+                      Glue: Silver Layer   ──→  S3 Tables  (order_details, enriched_events, product_performance)
+                      Glue: Gold Layer     ──→  S3 Tables  (customer_analytics, realtime_metrics)
+```
 
-Project description goes here.
+## What You'll Build
+
+| Layer | Storage | Tables | Technique |
+|-------|---------|--------|-----------|
+| Bronze | S3 + Glue Catalog Iceberg | orders, users, products, events | CDC MERGE INTO, append-only INSERT |
+| Silver | S3 Tables (managed Iceberg) | order_details, enriched_events, product_performance | JOINs, window functions, aggregations |
+| Gold | S3 Tables (managed Iceberg) | customer_analytics, realtime_metrics | Monthly/hourly business aggregations |
+
+## Repo Structure
+
+```
+starter-code/           ← Your working directory
+├── project.ipynb       ← Main notebook: deploy, run jobs, validate, explore Iceberg
+├── glue-jobs/          ← 4 Glue ETL scripts with TODOs to complete
+│   ├── cdc-batch/      ← CDC Bronze (MERGE INTO)
+│   ├── events/         ← Events Bronze (INSERT)
+│   ├── silver/         ← Silver enrichment layer
+│   └── gold/           ← Gold aggregation layer
+└── datasets/           ← CDC and clickstream JSON data
+
+project-solution/       ← Reference solution (don't peek until you're stuck)
+```
 
 ## Getting Started
 
-Instructions for how to get a copy of the project running on your local machine.
+1. Deploy the CloudFormation stack (provided in the lab environment)
+2. Open `starter-code/project.ipynb`
+3. Fill in your resource names from the stack outputs
+4. Complete the TODOs in the 4 Glue job scripts
+5. Run the notebook end-to-end to validate
 
-### Dependencies
+## AWS Services Used
 
-```
-Examples here
-```
-
-### Installation
-
-Step by step explanation of how to get a dev environment running.
-
-List out the steps
-
-```
-Give an example here
-```
-
-## Testing
-
-Explain the steps needed to run any automated tests
-
-### Break Down Tests
-
-Explain what each test does and why
-
-```
-Examples here
-```
-
-## Project Instructions
-
-This section should contain all the student deliverables for this project.
-
-## Built With
-
-* [Item1](www.item1.com) - Description of item
-* [Item2](www.item2.com) - Description of item
-* [Item3](www.item3.com) - Description of item
-
-Include all items used to build project.
-
-## License
-
-[License](LICENSE.txt)
+- **AWS Glue** — Spark ETL jobs for each medallion layer
+- **Amazon S3** — Raw data and Bronze Iceberg tables
+- **S3 Tables** — Managed Iceberg for Silver and Gold layers
+- **Amazon Athena** — SQL validation queries
+- **Apache Iceberg** — Table format with MERGE INTO, snapshots, and time-travel
