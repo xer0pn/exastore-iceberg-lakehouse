@@ -62,7 +62,13 @@ glueContext = GlueContext(sc)
 #     .config(f"spark.sql.catalog.{S3T_CAT}.warehouse", f"s3://{BUCKET}/silver-warehouse/") \
 #     .getOrCreate()
 
-spark = glueContext.spark_session  # Replace this with SparkSession.builder above
+spark = SparkSession.builder \
+    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
+    .config(f"spark.sql.catalog.{S3T_CAT}", "org.apache.iceberg.spark.SparkCatalog") \
+    .config(f"spark.sql.catalog.{S3T_CAT}.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") \
+    .config(f"spark.sql.catalog.{S3T_CAT}.glue.id", f"{ACCOUNT_ID}:s3tablescatalog/{TABLE_BUCKET_NAME}") \
+    .config(f"spark.sql.catalog.{S3T_CAT}.warehouse", f"s3://{BUCKET}/silver-warehouse/") \
+    .getOrCreate()
 
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
@@ -82,6 +88,15 @@ logger.info(f"Reading bronze from: {CATALOG}.{DB_BRONZE}")
 #     )
 # except Exception as e:
 #     logger.info(f"Namespace already exists: {e}")
+import boto3
+glue_client = boto3.client('glue', region_name=AWS_REGION)
+try:
+    glue_client.create_database(
+        CatalogId=f"{ACCOUNT_ID}:s3tablescatalog/{TABLE_BUCKET_NAME}",
+        DatabaseInput={'Name': DB_SILVER}
+    )
+except Exception as e:
+    logger.info(f"Namespace already exists or is already available: {e}")
 
 
 def create_silver_table(name, query):
@@ -95,7 +110,10 @@ def create_silver_table(name, query):
     # logger.info(f"{name}: {df.count()} rows to write")
     # spark.sql(f"DROP TABLE IF EXISTS {fqn} PURGE")
     # df.writeTo(fqn).using("iceberg").tableProperty("format-version", "2").create()
-    pass
+    df = spark.sql(query)
+    logger.info(f"{name}: {df.count()} rows to write")
+    spark.sql(f"DROP TABLE IF EXISTS {fqn} PURGE")
+    df.writeTo(fqn).using("iceberg").tableProperty("format-version", "2").create()
 
 
 # ── 1. order_details ─────────────────────────────────────────────────────────
@@ -112,6 +130,26 @@ def create_silver_table(name, query):
 #   - customer_segment: CASE on COUNT(*) OVER (PARTITION BY user_id) (1=New, <=3 Repeat, <=10 Loyal, else VIP)
 #   - Time features: order_day_of_week, order_hour
 #   - silver_processed_at: current_timestamp()
+create_silver_table("order_details", f"""
+    SELECT o.order_id, o.user_id, o.total_amount, CAST(o.created_at AS DATE) AS order_date,
+           date_format(o.created_at, 'yyyy-MM') AS order_month,
+           concat_ws(' ', u.first_name, u.last_name) AS customer_name,
+           u.email, u.city, u.state, CAST(u.created_at AS DATE) AS registration_date,
+           COUNT(*) OVER (PARTITION BY o.user_id ORDER BY o.created_at
+                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS customer_order_sequence,
+           SUM(o.total_amount) OVER (PARTITION BY o.user_id ORDER BY o.created_at
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS customer_lifetime_value,
+           CASE WHEN o.total_amount < 50 THEN 'Low' WHEN o.total_amount < 200 THEN 'Medium'
+                WHEN o.total_amount < 500 THEN 'High' ELSE 'Premium' END AS order_value_segment,
+           CASE WHEN COUNT(*) OVER (PARTITION BY o.user_id) = 1 THEN 'New'
+                WHEN COUNT(*) OVER (PARTITION BY o.user_id) <= 3 THEN 'Repeat'
+                WHEN COUNT(*) OVER (PARTITION BY o.user_id) <= 10 THEN 'Loyal' ELSE 'VIP' END AS customer_segment,
+           dayofweek(o.created_at) AS order_day_of_week, hour(o.created_at) AS order_hour,
+           current_timestamp() AS silver_processed_at
+    FROM {CATALOG}.{DB_BRONZE}.orders o
+    JOIN {CATALOG}.{DB_BRONZE}.users u ON o.user_id = u.id
+    WHERE COALESCE(o.is_deleted, false) = false
+""")
 
 # ── 2. enriched_events ───────────────────────────────────────────────────────
 # TODO 5: Create silver.enriched_events by querying bronze.
@@ -124,6 +162,23 @@ def create_silver_table(name, query):
 #   - event_sequence_in_session: COUNT(*) OVER (PARTITION BY session_id ORDER BY event_timestamp)
 #   - Time features: event_hour, event_day_of_week, event_date (cast to DATE)
 # Filter: WHERE event_date >= DATE '2024-01-01'
+create_silver_table("enriched_events", f"""
+    SELECT e.event_id, e.user_id, e.session_id, e.page_url, e.source, e.event_type, e.event_timestamp,
+           concat_ws(' ', u.first_name, u.last_name) AS user_name, u.email AS user_email,
+           datediff(CAST(e.event_timestamp AS DATE), CAST(u.created_at AS DATE)) AS days_since_registration,
+           u.city AS user_city, u.state AS user_state,
+           p.name AS product_name, p.category AS product_category, p.price AS product_price,
+           CASE WHEN e.event_type = 'purchase' THEN COALESCE(e.order_value, p.price) END AS revenue,
+           COUNT(*) OVER (PARTITION BY e.session_id ORDER BY e.event_timestamp
+                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS event_sequence_in_session,
+           hour(e.event_timestamp) AS event_hour, dayofweek(e.event_timestamp) AS event_day_of_week,
+           CAST(e.event_timestamp AS DATE) AS event_date,
+           current_timestamp() AS silver_processed_at
+    FROM {CATALOG}.{DB_BRONZE}.events e
+    LEFT JOIN {CATALOG}.{DB_BRONZE}.users u ON e.user_id = u.id
+    LEFT JOIN {CATALOG}.{DB_BRONZE}.products p ON e.product_id = p.id
+    WHERE CAST(e.event_timestamp AS DATE) >= DATE '2024-01-01'
+""")
 
 # ── 3. product_performance ───────────────────────────────────────────────────
 # TODO 6: Create silver.product_performance by querying bronze.
@@ -134,6 +189,29 @@ def create_silver_table(name, query):
 #   - Visitor metrics: unique_visitors (distinct user_id), unique_sessions
 #   - Revenue: total_revenue (sum order_value for purchases), avg_purchase_value
 #   - Conversion rates: view_to_purchase_rate, cart_to_purchase_rate
+create_silver_table("product_performance", f"""
+    SELECT p.id AS product_id, p.name AS product_name, p.category, p.price,
+           p.stock_quantity, p.is_active,
+           SUM(CASE WHEN e.event_type = 'page_view' THEN 1 ELSE 0 END) AS page_views,
+           SUM(CASE WHEN e.event_type = 'add_to_cart' THEN 1 ELSE 0 END) AS add_to_carts,
+           SUM(CASE WHEN e.event_type = 'purchase' THEN 1 ELSE 0 END) AS purchases,
+           SUM(CASE WHEN e.event_type = 'click' THEN 1 ELSE 0 END) AS clicks,
+           COUNT(e.event_id) AS total_events,
+           COUNT(DISTINCT e.user_id) AS unique_visitors,
+           COUNT(DISTINCT e.session_id) AS unique_sessions,
+           SUM(CASE WHEN e.event_type = 'purchase' THEN COALESCE(e.order_value, 0.0) ELSE 0.0 END) AS total_revenue,
+           AVG(CASE WHEN e.event_type = 'purchase' THEN e.order_value END) AS avg_purchase_value,
+           CASE WHEN SUM(CASE WHEN e.event_type = 'page_view' THEN 1 ELSE 0 END) = 0 THEN 0.0
+                ELSE SUM(CASE WHEN e.event_type = 'purchase' THEN 1 ELSE 0 END) * 100.0 /
+                     SUM(CASE WHEN e.event_type = 'page_view' THEN 1 ELSE 0 END) END AS view_to_purchase_rate,
+           CASE WHEN SUM(CASE WHEN e.event_type = 'add_to_cart' THEN 1 ELSE 0 END) = 0 THEN 0.0
+                ELSE SUM(CASE WHEN e.event_type = 'purchase' THEN 1 ELSE 0 END) * 100.0 /
+                     SUM(CASE WHEN e.event_type = 'add_to_cart' THEN 1 ELSE 0 END) END AS cart_to_purchase_rate,
+           current_timestamp() AS silver_processed_at
+    FROM {CATALOG}.{DB_BRONZE}.products p
+    LEFT JOIN {CATALOG}.{DB_BRONZE}.events e ON p.id = e.product_id
+    GROUP BY p.id, p.name, p.category, p.price, p.stock_quantity, p.is_active
+""")
 
 logger.info("Silver layer complete")
 job.commit()
